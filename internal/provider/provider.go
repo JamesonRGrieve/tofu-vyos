@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Package provider implements the aruba-aos OpenTofu/Terraform provider — a
-// native client for the ArubaOS-Switch (AOS-S) REST API v8. It is generic over
-// the API surface (the aruba_aos_object resource/data source address any
-// /rest/v8 path), giving 100% feature coverage without per-feature code.
+// Package provider implements the vyos OpenTofu/Terraform provider — a native
+// client for the VyOS HTTP API. It is generic over the API surface (the
+// vyos_config resource/data source address any config path), giving 100%
+// feature coverage of the VyOS config tree without per-feature code.
 package provider
 
 import (
@@ -17,62 +17,57 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ provider.Provider = (*aosProvider)(nil)
+var _ provider.Provider = (*vyosProvider)(nil)
 
 // New returns the provider factory for a given version.
 func New(version string) func() provider.Provider {
-	return func() provider.Provider { return &aosProvider{version: version} }
+	return func() provider.Provider { return &vyosProvider{version: version} }
 }
 
-type aosProvider struct {
+type vyosProvider struct {
 	version string
 }
 
 type providerModel struct {
 	Host     types.String `tfsdk:"host"`
-	Username types.String `tfsdk:"username"`
-	Password types.String `tfsdk:"password"`
+	Key      types.String `tfsdk:"key"`
 	Insecure types.Bool   `tfsdk:"insecure"`
 }
 
-func (p *aosProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
-	// Single-token type name -> resources are `vyos_object`, so Terraform's
+func (p *vyosProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+	// Single-token type name -> resources are `vyos_config`, so Terraform's
 	// prefix-before-first-underscore inference resolves the local name cleanly
-	// (the source address is still jamesonrgrieve/vyos).
+	// (the source address is jamesonrgrieve/vyos).
 	resp.TypeName = "vyos"
 	resp.Version = p.version
 }
 
-func (p *aosProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
+func (p *vyosProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Native provider for ArubaOS-Switch (AOS-S) switches (2530/2920/2930F, 16.x) " +
-			"via the REST API v8. Not for ArubaOS-CX — use aruba/aoscx for those.",
+		MarkdownDescription: "Native provider for VyOS routers/firewalls via the VyOS HTTP API " +
+			"(`/configure`, `/retrieve`, `/config-file`). API-key authenticated; config-path based.",
 		Attributes: map[string]schema.Attribute{
 			"host": schema.StringAttribute{
 				Required:            true,
-				MarkdownDescription: "Switch address (host or host:port), no scheme.",
+				MarkdownDescription: "Router address (host or host:port), no scheme. The API is served over HTTPS.",
 			},
-			"username": schema.StringAttribute{
-				Required:            true,
-				MarkdownDescription: "AOS-S operator/manager username.",
-			},
-			"password": schema.StringAttribute{
+			"key": schema.StringAttribute{
 				Required:            true,
 				Sensitive:           true,
-				MarkdownDescription: "AOS-S password.",
+				MarkdownDescription: "VyOS HTTP API key (`service https api keys id <name> key <key>`).",
 			},
 			"insecure": schema.BoolAttribute{
 				Optional: true,
-				MarkdownDescription: "Skip TLS verification (default true — AOS-S ships a self-signed cert). " +
+				MarkdownDescription: "Skip TLS verification (default true — VyOS ships a self-signed cert). " +
 					"Set false only with a trusted cert installed.",
 			},
 		},
 	}
 }
 
-func (p *aosProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+func (p *vyosProvider) Configure(_ context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	var cfg providerModel
-	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
+	resp.Diagnostics.Append(req.Config.Get(context.Background(), &cfg)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -82,18 +77,17 @@ func (p *aosProvider) Configure(ctx context.Context, req provider.ConfigureReque
 	}
 	client := vyos.NewClient(vyos.Config{
 		Host:     cfg.Host.ValueString(),
-		Username: cfg.Username.ValueString(),
-		Password: cfg.Password.ValueString(),
+		Key:      cfg.Key.ValueString(),
 		Insecure: insecure,
 	})
 	resp.ResourceData = client
 	resp.DataSourceData = client
 }
 
-func (p *aosProvider) Resources(_ context.Context) []func() resource.Resource {
+func (p *vyosProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{NewObjectResource}
 }
 
-func (p *aosProvider) DataSources(_ context.Context) []func() datasource.DataSource {
+func (p *vyosProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{NewObjectDataSource}
 }

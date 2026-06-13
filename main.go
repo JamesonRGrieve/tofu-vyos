@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Command aruba-aos is the OpenTofu/Terraform provider plugin entrypoint for
-// ArubaOS-Switch (AOS-S) switches via the REST API v8.
+// Command vyos is the OpenTofu/Terraform provider plugin entrypoint for VyOS
+// routers/firewalls via the VyOS HTTP API.
 package main
 
 import (

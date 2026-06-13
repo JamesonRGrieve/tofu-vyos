@@ -1,13 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// Package aos is a minimal client for the ArubaOS-Switch (AOS-S) REST API
-// (v8, HTTPS, cookie-based session auth) served by ProVision-era switches
-// such as the 2530 / 2920 / 2930F running WB/YA/YC firmware (16.x).
+// Package vyos is a minimal client for the VyOS HTTP API
+// (https://docs.vyos.io/en/latest/automation/vyos-api.html).
 //
-// AOS-S is NOT ArubaOS-CX: the official aruba/terraform-provider-aoscx targets
-// CX only and does not manage these switches. AOS-S has no Terraform provider
-// upstream, hence this one. The API surface is documented in HPE's "REST API
-// for AOS-S" guides; this client is generic over it (any /rest/v8 path).
+// Unlike a REST CRUD API, VyOS is *config-path* based. Every request is an HTTP
+// POST of multipart/form-data carrying two fields:
+//
+//   - data : a JSON document describing the operation — an object (or a list of
+//     objects) of the form {"op": ..., "path": [...]}.
+//   - key  : the plaintext API key configured under `service https api`.
+//
+// Endpoints used by this provider:
+//
+//   - /configure : op "set" / "delete" — mutates the config and commits the
+//     change transactionally (a successful POST IS a commit).
+//   - /retrieve  : op "showConfig" (subtree as JSON), "returnValues" (leaf
+//     list), "exists" (bool) — read the running config at a path.
+//   - /config-file : op "save" — persist the running config to /config/config.boot.
+//
+// Every endpoint returns the same envelope: {"success": bool, "data": ...,
+// "error": string|null}. A non-2xx HTTP status or success=false is an error.
+// This client is generic over the API: any config path is expressible.
 package vyos
 
 import (
@@ -16,225 +29,206 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
-// Client is a session-authenticated AOS-S REST client. It logs in lazily on
-// the first call and reuses the session cookie; callers may share one Client
-// across resources (the provider does). Safe for concurrent use.
+// Client is an API-key-authenticated VyOS HTTP API client. The key travels as a
+// form field on every request; there is no session/cookie to establish, so the
+// client is stateless and safe for concurrent use. Callers may share one Client
+// across resources (the provider does).
 type Client struct {
-	base     string // e.g. https://192.168.2.210/rest/v8
-	user     string
-	password string
-	http     *http.Client
-
-	mu     sync.Mutex
-	cookie string // "sessionId=..." once logged in
+	base string // e.g. https://192.168.7.x  (no trailing slash, no path)
+	key  string
+	http *http.Client
 }
 
 // Config configures a Client.
 type Config struct {
-	// Host is the switch address (host or host:port), no scheme.
+	// Host is the router address (host or host:port), no scheme. VyOS serves the
+	// API over HTTPS; the port defaults to 443 unless included here.
 	Host string
-	// Username / Password are the AOS-S operator/manager credentials.
-	Username string
-	Password string
-	// Insecure skips TLS verification (AOS-S ships a self-signed cert; true is
-	// the norm on a lab/OOB management network).
+	// Key is the plaintext API key (service https api keys id <name> key <key>).
+	Key string
+	// Insecure skips TLS verification (VyOS ships a self-signed cert by default;
+	// true is the norm on a lab / OOB management network).
 	Insecure bool
-	// Timeout per request (default 30s).
+	// Timeout per request (default 60s — a commit can take a few seconds).
 	Timeout time.Duration
 }
 
-// NewClient builds a Client. It does not contact the switch until the first
+// NewClient builds a Client. It does not contact the router until the first
 // API call.
 func NewClient(c Config) *Client {
 	if c.Timeout == 0 {
-		c.Timeout = 30 * time.Second
+		c.Timeout = 60 * time.Second
 	}
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.Insecure}, //nolint:gosec // self-signed mgmt cert
-		// AOS-S serves one session at a time; keep connections lean.
-		MaxIdleConns:    2,
+		MaxIdleConns:    4,
 		IdleConnTimeout: 30 * time.Second,
 	}
 	host := strings.TrimSuffix(strings.TrimPrefix(c.Host, "https://"), "/")
 	host = strings.TrimPrefix(host, "http://")
 	return &Client{
-		base:     fmt.Sprintf("https://%s/rest/v8", host),
-		user:     c.Username,
-		password: c.Password,
-		http:     &http.Client{Timeout: c.Timeout, Transport: tr},
+		base: "https://" + host,
+		key:  c.Key,
+		http: &http.Client{Timeout: c.Timeout, Transport: tr},
 	}
 }
 
-// APIError is returned when the switch responds with a non-2xx status.
+// Command is one VyOS API operation. VyOS expresses a config command as an op
+// plus a path array; for set/delete the *value* is the final element of the
+// path (e.g. set interfaces ethernet eth1 address 1.2.3.4/24 →
+// path ["interfaces","ethernet","eth1","address","1.2.3.4/24"]). Callers
+// therefore encode values as trailing path segments rather than a separate
+// field, which keeps this client generic over every config path.
+type Command struct {
+	Op   string   `json:"op"`
+	Path []string `json:"path,omitempty"`
+}
+
+// envelope is the universal VyOS API response shape.
+type envelope struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data"`
+	Error   *string         `json:"error"`
+}
+
+// APIError is returned when VyOS responds with a non-2xx status or success=false.
 type APIError struct {
-	Method string
-	Path   string
-	Status int
-	Body   string
+	Endpoint string
+	Status   int
+	Message  string // the API `error` field, or raw body on a transport-level failure
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("aos %s %s: HTTP %d: %s", e.Method, e.Path, e.Status, e.Body)
+	return fmt.Sprintf("vyos %s: HTTP %d: %s", e.Endpoint, e.Status, e.Message)
 }
 
-// NotFound reports whether err is an APIError with a 404 status.
+// NotFound reports whether err is an APIError whose message indicates the
+// requested config path is absent/empty. VyOS has no 404; showConfig on a
+// missing path returns success=false with an "empty"/"not exist"/"invalid"
+// style message, which we normalize here so the resource Read can drop the
+// object from state cleanly.
 func NotFound(err error) bool {
 	var ae *APIError
 	if e, ok := err.(*APIError); ok {
 		ae = e
 	}
-	return ae != nil && ae.Status == http.StatusNotFound
+	if ae == nil {
+		return false
+	}
+	m := strings.ToLower(ae.Message)
+	return strings.Contains(m, "empty") ||
+		strings.Contains(m, "is not valid") ||
+		strings.Contains(m, "not exist") ||
+		strings.Contains(m, "nonexistent") ||
+		strings.Contains(m, "does not exist")
 }
 
-// login establishes a session cookie. Caller must hold c.mu.
-func (c *Client) login() error {
-	body, _ := json.Marshal(map[string]string{"userName": c.user, "password": c.password})
-	req, err := http.NewRequest(http.MethodPost, c.base+"/login-sessions", bytes.NewReader(body))
+// post issues a single form-encoded request to the given endpoint with the
+// given data payload (already JSON-marshaled) and returns the decoded data
+// field on success.
+func (c *Client) post(endpoint string, data []byte) (json.RawMessage, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("data", string(data)); err != nil {
+		return nil, err
+	}
+	if err := mw.WriteField("key", c.key); err != nil {
+		return nil, err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.base+endpoint, &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("vyos %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var env envelope
+	if jerr := json.Unmarshal(raw, &env); jerr != nil {
+		// Non-JSON body (e.g. an auth/HTML error page) — surface it raw.
+		return nil, &APIError{Endpoint: endpoint, Status: resp.StatusCode, Message: strings.TrimSpace(string(raw))}
+	}
+	if resp.StatusCode/100 != 2 || !env.Success {
+		msg := ""
+		if env.Error != nil {
+			msg = *env.Error
+		}
+		return nil, &APIError{Endpoint: endpoint, Status: resp.StatusCode, Message: msg}
+	}
+	return env.Data, nil
+}
+
+// Configure POSTs one or more set/delete commands to /configure. A successful
+// response means the change was applied AND committed (VyOS commits the session
+// transactionally). Passing >1 command sends them as a JSON list so they commit
+// atomically.
+func (c *Client) Configure(cmds []Command) error {
+	if len(cmds) == 0 {
+		return nil
+	}
+	var data []byte
+	var err error
+	if len(cmds) == 1 {
+		data, err = json.Marshal(cmds[0])
+	} else {
+		data, err = json.Marshal(cmds)
+	}
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("aos login: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode/100 != 2 {
-		return &APIError{Method: "POST", Path: "/login-sessions", Status: resp.StatusCode, Body: string(raw)}
-	}
-	var out struct {
-		Cookie string `json:"cookie"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil || out.Cookie == "" {
-		return fmt.Errorf("aos login: no cookie in response: %s", string(raw))
-	}
-	c.cookie = out.Cookie
-	return nil
+	_, err = c.post("/configure", data)
+	return err
 }
 
-// loginRetry logs in, retrying with backoff on HTTP 503 "no free REST sessions"
-// — AOS-S caps concurrent REST sessions very low (≈5), so a slot may need a
-// moment to free (idle sessions time out). Caller must hold c.mu.
-func (c *Client) loginRetry() error {
-	delays := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second, 20 * time.Second, 30 * time.Second}
-	var last error
-	for _, d := range delays {
-		if d > 0 {
-			time.Sleep(d)
-		}
-		err := c.login()
-		if err == nil {
-			return nil
-		}
-		var ae *APIError
-		if e, ok := err.(*APIError); ok {
-			ae = e
-		}
-		if ae == nil || ae.Status != http.StatusServiceUnavailable {
-			return err // not a session-pressure error — fail fast
-		}
-		last = err
-	}
-	return fmt.Errorf("aos login: exhausted retries waiting for a free REST session: %w", last)
-}
-
-// logoutLocked tears down the current session. Caller must hold c.mu.
-func (c *Client) logoutLocked() {
-	if c.cookie == "" {
-		return
-	}
-	req, err := http.NewRequest(http.MethodDelete, c.base+"/login-sessions", nil)
-	if err == nil {
-		req.Header.Set("Cookie", c.cookie)
-		if resp, derr := c.http.Do(req); derr == nil {
-			resp.Body.Close()
-		}
-	}
-	c.cookie = ""
-}
-
-// Logout tears down the session. Best-effort; errors are ignored.
-func (c *Client) Logout() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.logoutLocked()
-}
-
-// do performs one authenticated request and ALWAYS releases the session
-// afterwards (login → request → logout, under the mutex). AOS-S allows only a
-// handful of concurrent REST sessions, so holding one across a long Terraform
-// run (or leaking one per run) exhausts the cap; acquiring and releasing per
-// operation keeps at most one session live and never leaks. path is relative to
-// /rest/v8 and must start with "/". body may be nil.
-func (c *Client) do(method, path string, body []byte) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.loginRetry(); err != nil {
-		return nil, err
-	}
-	defer c.logoutLocked()
-	raw, status, err := c.attempt(method, path, body)
+// ShowConfig returns the running-config subtree at path as raw JSON (the
+// envelope `data` field). An empty path returns the entire configuration. A
+// NotFound error is returned when the path is absent.
+func (c *Client) ShowConfig(path []string) (json.RawMessage, error) {
+	data, err := json.Marshal(Command{Op: "showConfig", Path: path})
 	if err != nil {
 		return nil, err
 	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		// Session rejected — re-login once and retry.
-		c.cookie = ""
-		if err := c.loginRetry(); err != nil {
-			return nil, err
-		}
-		raw, status, err = c.attempt(method, path, body)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if status/100 != 2 {
-		return nil, &APIError{Method: method, Path: path, Status: status, Body: string(raw)}
-	}
-	return raw, nil
+	return c.post("/retrieve", data)
 }
 
-func (c *Client) attempt(method, path string, body []byte) ([]byte, int, error) {
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequest(method, c.base+path, rdr)
+// Exists reports whether the given config path is present (op "exists").
+func (c *Client) Exists(path []string) (bool, error) {
+	data, err := json.Marshal(Command{Op: "exists", Path: path})
 	if err != nil {
-		return nil, 0, err
+		return false, err
 	}
-	req.Header.Set("Cookie", c.cookie)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.http.Do(req)
+	raw, err := c.post("/retrieve", data)
 	if err != nil {
-		return nil, 0, fmt.Errorf("aos %s %s: %w", method, path, err)
+		return false, err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	return raw, resp.StatusCode, nil
+	var b bool
+	if uerr := json.Unmarshal(raw, &b); uerr != nil {
+		return false, fmt.Errorf("vyos /retrieve exists: unexpected data: %s", string(raw))
+	}
+	return b, nil
 }
 
-// Get fetches a resource. path is relative to /rest/v8 (must start with "/").
-func (c *Client) Get(path string) ([]byte, error) { return c.do(http.MethodGet, path, nil) }
-
-// Put upserts a resource with the given JSON body.
-func (c *Client) Put(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPut, path, body)
+// Save persists the running config to /config/config.boot (op "save").
+func (c *Client) Save() error {
+	data, err := json.Marshal(Command{Op: "save"})
+	if err != nil {
+		return err
+	}
+	_, err = c.post("/config-file", data)
+	return err
 }
-
-// Post creates a resource in a collection with the given JSON body.
-func (c *Client) Post(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPost, path, body)
-}
-
-// Delete removes a resource.
-func (c *Client) Delete(path string) ([]byte, error) { return c.do(http.MethodDelete, path, nil) }

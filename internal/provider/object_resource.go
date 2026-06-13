@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/JamesonRGrieve/tofu-vyos/internal/vyos"
@@ -24,66 +25,52 @@ var (
 	_ resource.ResourceWithImportState = (*objectResource)(nil)
 )
 
-// NewObjectResource constructs the generic aruba_aos_object resource.
+// NewObjectResource constructs the generic vyos_config resource.
 func NewObjectResource() resource.Resource { return &objectResource{} }
 
 type objectResource struct {
 	client *vyos.Client
 }
 
-// objectModel is the state/plan shape for aruba_aos_object.
+// objectModel is the state/plan shape for vyos_config.
 type objectModel struct {
-	ID           types.String `tfsdk:"id"`
-	Path         types.String `tfsdk:"path"`
-	CreatePath   types.String `tfsdk:"create_path"`
-	DeleteMethod types.String `tfsdk:"delete_method"`
-	DeleteBody   types.String `tfsdk:"delete_body"`
-	Body         types.String `tfsdk:"body"`
+	ID     types.String `tfsdk:"id"`
+	Path   types.List   `tfsdk:"path"`
+	Config types.String `tfsdk:"config"`
 }
 
 func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_object"
+	resp.TypeName = req.ProviderTypeName + "_config"
 }
 
 func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A generic ArubaOS-Switch REST resource addressed by its `/rest/v8` path. " +
-			"Covers 100% of the AOS-S API: any singleton (`system`, `stp`, `dns`, `lldp`) or " +
-			"collection item (`vlans/40`, `vlans-ports/40-3`, `ports/5`, `snmp-server/communities/public`). " +
-			"`body` declares only the keys this resource manages; device-returned keys outside `body` are " +
-			"ignored for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
+		MarkdownDescription: "A generic VyOS configuration node addressed by its config `path` " +
+			"(a list of path segments, e.g. `[\"interfaces\",\"ethernet\",\"eth1\"]`). " +
+			"Covers 100% of the VyOS config tree: any node, from a leaf " +
+			"(`[\"system\",\"host-name\"]`) to a whole subtree (`[\"service\",\"dns\",\"forwarding\"]`). " +
+			"`config` declares only the keys this resource manages; device-returned keys outside `config` " +
+			"are ignored for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged config.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Resource id — equal to `path`.",
+				MarkdownDescription: "Resource id — the `path` segments joined by `/`.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"path": schema.StringAttribute{
+			"path": schema.ListAttribute{
+				ElementType: types.StringType,
+				Required:    true,
+				MarkdownDescription: "VyOS config path as an ordered list of segments. ForceNew — " +
+					"the node identity. E.g. `[\"interfaces\",\"ethernet\",\"eth1\"]`, `[\"system\",\"host-name\"]`.",
+				PlanModifiers: []planmodifier.List{requiresReplaceList{}},
+			},
+			"config": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "Addressed resource path under `/rest/v8` (leading slash optional), " +
-					"used for GET/PUT/DELETE. E.g. `vlans/40`, `system`, `vlans-ports/40-3`.",
-				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-			},
-			"create_path": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Collection path to POST to on create (e.g. `vlans` while `path` is `vlans/40`). " +
-					"When unset, create is an idempotent PUT to `path`. Carry it in the import id " +
-					"(`<path>|<create_path>`) so an imported resource matches config and lands at 0-diff.",
-			},
-			"delete_method": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "How to destroy: `DELETE` (default), `PUT` (send `delete_body` to `path` — " +
-					"reset a singleton to default), or `NONE` (no-op for un-deletable singletons). Carry it in the " +
-					"import id (`<path>|<create_path>|<delete_method>`) to match config.",
-			},
-			"delete_body": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "JSON body PUT to `path` on destroy when `delete_method = \"PUT\"`. Import id field 4.",
-			},
-			"body": schema.StringAttribute{
-				Required: true,
-				MarkdownDescription: "JSON object of the declared (managed) attributes. State holds the full " +
-					"device object; drift is detected only on these keys.",
+				MarkdownDescription: "JSON subtree of the declared (managed) config at `path`, in the same shape " +
+					"`/retrieve showConfig` returns: nested objects for sub-nodes, a string for a single-value leaf, " +
+					"an array of strings for a multi-value leaf, and `{}`/`null` for a valueless (tag-present) node. " +
+					"State holds the full device subtree; drift is detected only on these declared keys. The subtree " +
+					"is flattened into `set` commands on create/update (and removed keys into `delete` commands).",
 				PlanModifiers: []planmodifier.String{subsetSuppress{}},
 			},
 		},
@@ -103,24 +90,17 @@ func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = client
 }
 
-// normPath ensures a leading slash.
-func normPath(p string) string {
-	p = strings.TrimSpace(p)
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
+// pathSegments extracts the config path from the model as a Go string slice.
+func pathSegments(ctx context.Context, l types.List) ([]string, error) {
+	if l.IsNull() || l.IsUnknown() {
+		return nil, fmt.Errorf("path is null/unknown")
 	}
-	return p
-}
-
-// parentCollection returns the collection path for an item path by dropping the
-// last segment: "/vlans-ports/58-41" -> "/vlans-ports", "/vlans/58" -> "/vlans".
-// Returns "" for a top-level singleton (no parent).
-func parentCollection(p string) string {
-	i := strings.LastIndex(p, "/")
-	if i <= 0 {
-		return ""
+	var segs []string
+	diags := l.ElementsAs(ctx, &segs, false)
+	if diags.HasError() {
+		return nil, fmt.Errorf("path is not a list of strings")
 	}
-	return p[:i]
+	return segs, nil
 }
 
 func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -129,36 +109,23 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	body := []byte(m.Body.ValueString())
-	if !json.Valid(body) {
-		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
-		return
-	}
-	var err error
-	if !m.CreatePath.IsNull() && m.CreatePath.ValueString() != "" {
-		// Explicit collection POST (e.g. /vlans).
-		_, err = r.client.Post(normPath(m.CreatePath.ValueString()), body)
-	} else {
-		// Idempotent PUT to the item path; if the item doesn't exist yet
-		// (AOS-S replies 404 to PUT on a not-yet-present collection item, e.g.
-		// a new vlans-ports membership), fall back to POSTing the parent
-		// collection. This makes the generic resource handle both upsert-PUT
-		// singletons and POST-create collections without an explicit create_path.
-		p := normPath(m.Path.ValueString())
-		_, err = r.client.Put(p, body)
-		if err != nil && vyos.NotFound(err) {
-			if parent := parentCollection(p); parent != "" {
-				_, err = r.client.Post(parent, body)
-			}
-		}
-	}
+	segs, err := pathSegments(ctx, m.Path)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S create failed", err.Error())
+		resp.Diagnostics.AddError("Invalid path", err.Error())
 		return
 	}
-	m.ID = m.Path
-	// Store the declared body verbatim so the create plan/state are consistent;
-	// the next refresh (Read) replaces it with the full device object.
+	cmds, err := setCommands(segs, m.Config.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid config", err.Error())
+		return
+	}
+	if err := r.client.Configure(cmds); err != nil {
+		resp.Diagnostics.AddError("VyOS configure (set) failed", err.Error())
+		return
+	}
+	m.ID = types.StringValue(strings.Join(segs, "/"))
+	// Store the declared config verbatim so create plan/state are consistent;
+	// the next refresh (Read) replaces it with the full device subtree.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -168,44 +135,68 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := r.client.Get(normPath(m.Path.ValueString()))
+	segs, err := pathSegments(ctx, m.Path)
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid path", err.Error())
+		return
+	}
+	raw, err := r.client.ShowConfig(segs)
 	if err != nil {
 		if vyos.NotFound(err) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+		resp.Diagnostics.AddError("VyOS retrieve (showConfig) failed", err.Error())
 		return
 	}
-	// Store the full device object (compacted). The subset plan modifier
-	// reconciles it against the declared config body at plan time.
+	if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
+		// Path absent / empty subtree — treat as gone.
+		resp.State.RemoveResource(ctx)
+		return
+	}
 	compact, err := compactJSON(raw)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+		resp.Diagnostics.AddError("VyOS read: invalid JSON from device", err.Error())
 		return
 	}
-	m.Body = types.StringValue(compact)
-	m.ID = m.Path
+	m.Config = types.StringValue(compact)
+	m.ID = types.StringValue(strings.Join(segs, "/"))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
 func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var m objectModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
+	var plan, state objectModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	body := []byte(m.Body.ValueString())
-	if !json.Valid(body) {
-		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
+	segs, err := pathSegments(ctx, plan.Path)
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid path", err.Error())
 		return
 	}
-	if _, err := r.client.Put(normPath(m.Path.ValueString()), body); err != nil {
-		resp.Diagnostics.AddError("AOS-S update failed", err.Error())
+	// set all declared leaves from the new config; delete leaves that were in
+	// the prior *declared* config (held as the full subtree in state) but are
+	// no longer declared. We diff declared-new against declared-old, not against
+	// the whole device object, so unmanaged config is never touched.
+	setCmds, err := setCommands(segs, plan.Config.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid config", err.Error())
 		return
 	}
-	m.ID = m.Path
-	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+	delCmds, err := pruneCommands(segs, state.Config.ValueString(), plan.Config.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Invalid prior config", err.Error())
+		return
+	}
+	cmds := append(delCmds, setCmds...)
+	if err := r.client.Configure(cmds); err != nil {
+		resp.Diagnostics.AddError("VyOS configure (update) failed", err.Error())
+		return
+	}
+	plan.ID = types.StringValue(strings.Join(segs, "/"))
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -214,62 +205,170 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	method := "DELETE"
-	if !m.DeleteMethod.IsNull() && m.DeleteMethod.ValueString() != "" {
-		method = strings.ToUpper(m.DeleteMethod.ValueString())
-	}
-	var err error
-	switch method {
-	case "NONE":
-		// Singleton that cannot be deleted (e.g. /system); just drop from state.
-	case "PUT":
-		if m.DeleteBody.IsNull() {
-			resp.Diagnostics.AddError("delete_method=PUT requires delete_body", "no reset body provided")
-			return
-		}
-		_, err = r.client.Put(normPath(m.Path.ValueString()), []byte(m.DeleteBody.ValueString()))
-	default: // DELETE
-		_, err = r.client.Delete(normPath(m.Path.ValueString()))
-		if err != nil && vyos.NotFound(err) {
-			err = nil // already gone
-		}
-	}
+	segs, err := pathSegments(ctx, m.Path)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S delete failed", err.Error())
+		resp.Diagnostics.AddError("Invalid path", err.Error())
+		return
+	}
+	err = r.client.Configure([]vyos.Command{{Op: "delete", Path: segs}})
+	if err != nil && !vyos.NotFound(err) {
+		resp.Diagnostics.AddError("VyOS configure (delete) failed", err.Error())
 	}
 }
 
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import id is a pipe-delimited tuple so the imported state matches the
-	// config's operational hints exactly (→ 0-diff, no spurious update/replace):
-	//   <path>[|<create_path>[|<delete_method>[|<delete_body>]]]
-	// Empty fields are treated as null. Body is populated on the following Read.
-	parts := strings.Split(req.ID, "|")
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("path"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parts[0])...)
-	setOpt := func(p string, i int) {
-		if i < len(parts) && parts[i] != "" {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), parts[i])...)
-		} else {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), types.StringNull())...)
+	// Import id is the config path, segments joined by "/" (the same form the
+	// computed id takes), e.g. "interfaces/ethernet/eth1". The declared config
+	// is seeded to "{}" and populated by the following Read with the full device
+	// subtree; the subset plan modifier then reconciles it to 0-diff against the
+	// user's config block.
+	segs := strings.Split(strings.Trim(req.ID, "/"), "/")
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("path"), segs)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), strings.Join(segs, "/"))...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("config"), "{}")...)
+}
+
+// ---------------------------------------------------------------------------
+// flatten — translate a JSON config subtree (the showConfig shape) into VyOS
+// `set` path-arrays. Each leaf becomes one command whose path is the base path
+// plus the chain of object keys plus, for value leaves, the value as the final
+// segment.
+//
+// showConfig encodes config nodes as:
+//   - nested object        → a config sub-node (recurse into keys)
+//   - string               → a single-value leaf      (key, value)
+//   - array of strings     → a multi-value leaf        (key, v1), (key, v2)...
+//   - {} or null           → a valueless / tag-present node (key)
+// ---------------------------------------------------------------------------
+
+// setCommands flattens the declared config subtree at base into `set` commands.
+func setCommands(base []string, configJSON string) ([]vyos.Command, error) {
+	var v any
+	if err := json.Unmarshal([]byte(configJSON), &v); err != nil {
+		return nil, fmt.Errorf("`config` must be valid JSON: %w", err)
+	}
+	leaves := flattenLeaves(base, v)
+	cmds := make([]vyos.Command, 0, len(leaves))
+	for _, lp := range leaves {
+		cmds = append(cmds, vyos.Command{Op: "set", Path: lp})
+	}
+	return cmds, nil
+}
+
+// pruneCommands returns `delete` commands for leaves present in the prior
+// declared subtree but absent from the new one. base is the node path.
+func pruneCommands(base []string, priorJSON, newJSON string) ([]vyos.Command, error) {
+	var pv, nv any
+	if err := json.Unmarshal([]byte(priorJSON), &pv); err != nil {
+		// Prior state may legitimately hold the full device subtree (post-Read);
+		// if it does not parse, skip pruning rather than erroring.
+		return nil, nil //nolint:nilerr // best-effort prune; new set commands still apply
+	}
+	if err := json.Unmarshal([]byte(newJSON), &nv); err != nil {
+		return nil, fmt.Errorf("`config` must be valid JSON: %w", err)
+	}
+	prior := leafSet(flattenLeaves(base, pv))
+	current := leafSet(flattenLeaves(base, nv))
+	var cmds []vyos.Command
+	// Sort for deterministic ordering (stable tests + readable plans).
+	keys := make([]string, 0, len(prior))
+	for k := range prior {
+		if _, still := current[k]; !still {
+			keys = append(keys, k)
 		}
 	}
-	setOpt("create_path", 1)
-	setOpt("delete_method", 2)
-	setOpt("delete_body", 3)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
+	sort.Strings(keys)
+	for _, k := range keys {
+		cmds = append(cmds, vyos.Command{Op: "delete", Path: prior[k]})
+	}
+	return cmds, nil
+}
+
+// flattenLeaves walks a decoded JSON value rooted at prefix and returns one
+// path-array per leaf (set-command path).
+func flattenLeaves(prefix []string, v any) [][]string {
+	switch t := v.(type) {
+	case map[string]any:
+		if len(t) == 0 {
+			// valueless node (tag present, no children) — set the node itself.
+			return [][]string{appendCopy(prefix)}
+		}
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var out [][]string
+		for _, k := range keys {
+			out = append(out, flattenLeaves(appendCopy(prefix, k), t[k])...)
+		}
+		return out
+	case []any:
+		if len(t) == 0 {
+			return [][]string{appendCopy(prefix)}
+		}
+		var out [][]string
+		for _, e := range t {
+			out = append(out, appendCopy(prefix, scalarString(e)))
+		}
+		return out
+	case nil:
+		return [][]string{appendCopy(prefix)}
+	default:
+		return [][]string{appendCopy(prefix, scalarString(t))}
+	}
+}
+
+// scalarString renders a JSON scalar (string/number/bool) as a VyOS path
+// segment. Numbers come back from encoding/json as float64; render integers
+// without a trailing ".0".
+func scalarString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case float64:
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%v", t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+// leafSet keys a slice of leaf paths by their joined string for set membership.
+func leafSet(leaves [][]string) map[string][]string {
+	m := make(map[string][]string, len(leaves))
+	for _, lp := range leaves {
+		m[strings.Join(lp, "\x00")] = lp
+	}
+	return m
+}
+
+// appendCopy returns base with extra appended, without aliasing base's backing
+// array (each leaf must own its slice).
+func appendCopy(base []string, extra ...string) []string {
+	out := make([]string, 0, len(base)+len(extra))
+	out = append(out, base...)
+	out = append(out, extra...)
+	return out
 }
 
 // ---------------------------------------------------------------------------
 // subset plan modifier — suppress diff when every declared key already matches
-// the full device object held in prior state. This is what lets a subset
-// `body` import/refresh to 0-diff without clobbering unmanaged device fields.
+// the full device subtree held in prior state. This is what lets a subset
+// `config` import/refresh to 0-diff without clobbering unmanaged device config.
 // ---------------------------------------------------------------------------
 
 type subsetSuppress struct{}
 
 func (subsetSuppress) Description(context.Context) string {
-	return "Suppress diff when all declared JSON keys already match the device object in state."
+	return "Suppress diff when all declared config keys already match the device subtree in state."
 }
 func (subsetSuppress) MarkdownDescription(context.Context) string {
 	return (subsetSuppress{}).Description(nil)
@@ -282,42 +381,48 @@ func (subsetSuppress) PlanModifyString(_ context.Context, req planmodifier.Strin
 	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
-	// All declared (config) keys already match the device object in prior state:
-	// keep the full prior object and show no diff. Otherwise leave the planned
-	// (config) value in place so the drift surfaces as an update.
+	// All declared (config) keys already match the device subtree in prior
+	// state: keep the full prior subtree and show no diff. Otherwise leave the
+	// planned (config) value in place so the drift surfaces as an update.
 	if subsetMatches(req.StateValue.ValueString(), req.ConfigValue.ValueString()) {
 		resp.PlanValue = req.StateValue
 	}
 }
 
-// subsetMatches reports whether every top-level key in the config JSON object
-// is present in the prior JSON object with a structurally-equal value (config
-// is a value-subset of prior). Invalid JSON on either side returns false so the
-// caller falls back to a normal diff.
+// subsetMatches reports whether the config JSON value is a structural subset of
+// the prior JSON value: every object key the config declares is present in
+// prior with a structurally-equal (recursively subset-matched) value. Scalars
+// and arrays must be deep-equal. Invalid JSON on either side returns false so
+// the caller falls back to a normal diff.
 func subsetMatches(prior, cfg string) bool {
-	var p, c map[string]json.RawMessage
+	var p, c any
 	if json.Unmarshal([]byte(prior), &p) != nil {
 		return false
 	}
 	if json.Unmarshal([]byte(cfg), &c) != nil {
 		return false
 	}
-	for k, cv := range c {
-		pv, ok := p[k]
-		if !ok || !jsonEqual(cv, pv) {
-			return false
-		}
-	}
-	return true
+	return valueSubset(p, c)
 }
 
-// jsonEqual compares two raw JSON values structurally (order-insensitive).
-func jsonEqual(a, b json.RawMessage) bool {
-	var av, bv any
-	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
-		return false
+// valueSubset reports whether cfg is a subset of prior. Objects are matched
+// key-wise and recursively; everything else must be deep-equal.
+func valueSubset(prior, cfg any) bool {
+	cm, cok := cfg.(map[string]any)
+	pm, pok := prior.(map[string]any)
+	if cok {
+		if !pok {
+			return false
+		}
+		for k, cv := range cm {
+			pv, ok := pm[k]
+			if !ok || !valueSubset(pv, cv) {
+				return false
+			}
+		}
+		return true
 	}
-	return reflect.DeepEqual(av, bv)
+	return reflect.DeepEqual(prior, cfg)
 }
 
 // compactJSON re-serializes raw JSON in compact, key-sorted-by-encoder form.
@@ -331,4 +436,26 @@ func compactJSON(raw []byte) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// ---------------------------------------------------------------------------
+// requiresReplaceList — ForceNew for the `path` list attribute (no built-in
+// list RequiresReplace ships in this framework version's stringplanmodifier).
+// ---------------------------------------------------------------------------
+
+type requiresReplaceList struct{}
+
+func (requiresReplaceList) Description(context.Context) string {
+	return "Changing path forces resource replacement."
+}
+func (requiresReplaceList) MarkdownDescription(context.Context) string {
+	return (requiresReplaceList{}).Description(nil)
+}
+func (requiresReplaceList) PlanModifyList(_ context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if req.StateValue.IsNull() || req.PlanValue.IsUnknown() {
+		return
+	}
+	if !req.StateValue.Equal(req.PlanValue) {
+		resp.RequiresReplace = true
+	}
 }

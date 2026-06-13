@@ -1,39 +1,37 @@
 {
   "version": 1,
-  "domain": "net.switches.aruba-aos",
-  "title": "aruba-aos provider",
-  "description": "Native ArubaOS-Switch (AOS-S) REST API v8 OpenTofu/Terraform provider. Replaces the net/switches/hpe scottwinkler/shell adapter so the switch imports to 0-diff. Not ArubaOS-CX (that has aruba/aoscx).",
+  "domain": "net.routers.vyos",
+  "title": "vyos provider",
+  "description": "Native VyOS HTTP API OpenTofu/Terraform provider. Config-path based (set/delete/showConfig over /configure + /retrieve, API-key auth). Generic vyos_config resource + data source give 100% config-tree coverage; manage-declared-only subset model imports existing config to 0-diff.",
   "phases": [
     {
       "number": 1,
       "title": "Core (generic, full coverage)",
-      "exit_criteria": "Builds, vets, tests; one resource + data source cover all /rest/v8 paths.",
+      "exit_criteria": "Builds, vets, tests; one resource + data source cover all VyOS config paths.",
       "items": [
-        { "number": "1.1", "feature": "REST v8 transport (cookie login, GET/PUT/POST/DELETE, re-auth, logout, insecure TLS)", "done": true },
-        { "number": "1.2", "feature": "aruba_aos_object resource (CRUD + ImportState; PUT-upsert or POST-collection; DELETE/PUT-reset/NONE destroy)", "done": true },
-        { "number": "1.3", "feature": "Manage-declared-only drift: subset plan modifier (declared keys match device -> 0-diff; never clobbers unmanaged fields)", "done": true },
-        { "number": "1.4", "feature": "aruba_aos_object data source (read any path)", "done": true },
-        { "number": "1.5", "feature": "Unit tests for subset/normPath/compact helpers", "done": true }
+        { "number": "1.1", "feature": "VyOS HTTP API transport (multipart form data+key; /configure set/delete with atomic commit; /retrieve showConfig/exists; /config-file save; NotFound classification; insecure TLS)", "done": true },
+        { "number": "1.2", "feature": "vyos_config resource (CRUD + ImportState; path-list ForceNew; subtree flattened to set commands; update prunes removed leaves via delete)", "done": true },
+        { "number": "1.3", "feature": "Manage-declared-only drift: recursive subset plan modifier (declared keys match device -> 0-diff; never clobbers unmanaged config)", "done": true },
+        { "number": "1.4", "feature": "vyos_config data source (read any path via showConfig)", "done": true },
+        { "number": "1.5", "feature": "Unit tests for subset/flatten(setCommands)/prune/scalar/compact helpers", "done": true }
       ]
     },
     {
       "number": 2,
-      "title": "Validate against live AOS-S",
-      "exit_criteria": "house-aruba-2530 resources import to 0-diff through the provider.",
+      "title": "Validate against live VyOS",
+      "exit_criteria": "A lab VyOS node imports to 0-diff through the provider.",
       "items": [
-        { "number": "2.1", "feature": "Provider installable on the Semaphore runner (filesystem_mirror + scoped .terraformrc); tofu init verified (plan task 116: 139 add/0 change/0 destroy)", "done": true },
-        { "number": "2.2", "feature": "Live import to 0-diff proven: house-aruba-2530 imported + applied -> tofu plan = No changes (task 125)", "done": true },
-        { "number": "2.3", "feature": "Acceptance tests (TF_ACC) against a throwaway/lab AOS-S", "done": false }
+        { "number": "2.1", "feature": "Provider installable on the Semaphore runner (filesystem_mirror + scoped .terraformrc); tofu init verified", "done": false },
+        { "number": "2.2", "feature": "Live import to 0-diff proven against a lab VyOS (import + apply -> tofu plan = No changes)", "done": false },
+        { "number": "2.3", "feature": "Acceptance tests (TF_ACC) against a throwaway/lab VyOS", "done": false }
       ]
     },
     {
       "number": 3,
-      "title": "net/switches/hpe migration",
-      "exit_criteria": "module emits aruba_aos_object from native NetBox modeling; scottwinkler/shell retired; switch managed via Semaphore to 0-diff.",
+      "title": "net/routers integration",
+      "exit_criteria": "module emits vyos_config from native NetBox modeling; VyOS managed via Semaphore to 0-diff.",
       "items": [
-        { "number": "3.1", "feature": "required_providers + arubaos provider; vlan/vlan_port(tagged)/trunk_member/vlan_ip(OOB SVI)/stp converted to arubaos_object; shell_script + scripts/ removed. Validated; runner plan 139 add/0 change. (system hostname/gateway deferred — PUT /system whole-object replace would wipe the gateway)", "done": true },
-        { "number": "3.2", "feature": "Remaining feature resources (system/snmp/dns/ntp/syslog/lldp/dhcp-snoop/stp_port). No native NetBox schema yet -> need config_context modeling or typed sugar first", "done": false },
-        { "number": "3.3", "feature": "house-aruba-2530 onboarded to 0-diff via Semaphore: VLAN 58/81 created, OOB_NET SVI .8.72/26, HOME_HOSTS->58 (additive; VLAN 59 retained), renames applied. tofu plan = No changes", "done": true }
+        { "number": "3.1", "feature": "required_providers + vyos provider; NetBox-driven interfaces/firewall/nat/service emitted as vyos_config", "done": false }
       ]
     },
     {
@@ -41,7 +39,7 @@
       "title": "Ergonomics + release",
       "exit_criteria": "Optional typed sugar; CI; registry publish.",
       "items": [
-        { "number": "4.1", "feature": "Typed sugar resources (vlan, vlan_port, trunk, vlan_ip) over the generic core", "done": false },
+        { "number": "4.1", "feature": "Typed sugar resources (interface, firewall_rule, nat_rule) over the generic core", "done": false },
         { "number": "4.2", "feature": "CI (build/vet/test) + GoReleaser + registry publish + docs gen", "done": false }
       ]
     }

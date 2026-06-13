@@ -17,7 +17,7 @@ var (
 	_ datasource.DataSourceWithConfigure = (*objectDataSource)(nil)
 )
 
-// NewObjectDataSource constructs the generic aruba_aos_object data source.
+// NewObjectDataSource constructs the generic vyos_config data source.
 func NewObjectDataSource() datasource.DataSource { return &objectDataSource{} }
 
 type objectDataSource struct {
@@ -25,25 +25,27 @@ type objectDataSource struct {
 }
 
 type objectDataModel struct {
-	Path     types.String `tfsdk:"path"`
+	Path     types.List   `tfsdk:"path"`
 	Response types.String `tfsdk:"response"`
 }
 
 func (d *objectDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_object"
+	resp.TypeName = req.ProviderTypeName + "_config"
 }
 
 func (d *objectDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Read any ArubaOS-Switch REST resource by its `/rest/v8` path.",
+		MarkdownDescription: "Read any VyOS configuration subtree by its config `path` (a list of segments) " +
+			"via `/retrieve showConfig`. An empty `path` returns the entire configuration.",
 		Attributes: map[string]schema.Attribute{
-			"path": schema.StringAttribute{
+			"path": schema.ListAttribute{
+				ElementType:         types.StringType,
 				Required:            true,
-				MarkdownDescription: "Resource path under `/rest/v8` (leading slash optional), e.g. `vlans`, `system`, `vlans/40`.",
+				MarkdownDescription: "VyOS config path as a list of segments, e.g. `[\"interfaces\",\"ethernet\",\"eth0\"]`. Empty list = whole config.",
 			},
 			"response": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "The raw JSON response body from the switch.",
+				MarkdownDescription: "The config subtree at `path`, as compact JSON (the `data` field of the showConfig response).",
 			},
 		},
 	}
@@ -67,14 +69,21 @@ func (d *objectDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := d.client.Get(normPath(m.Path.ValueString()))
+	var segs []string
+	if !m.Path.IsNull() && !m.Path.IsUnknown() {
+		resp.Diagnostics.Append(m.Path.ElementsAs(ctx, &segs, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	raw, err := d.client.ShowConfig(segs)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+		resp.Diagnostics.AddError("VyOS retrieve (showConfig) failed", err.Error())
 		return
 	}
 	compact, err := compactJSON(raw)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+		resp.Diagnostics.AddError("VyOS read: invalid JSON from device", err.Error())
 		return
 	}
 	m.Response = types.StringValue(compact)
