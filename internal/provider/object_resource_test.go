@@ -303,6 +303,59 @@ func TestCompactJSON(t *testing.T) {
 	}
 }
 
+func TestUnwrapLeafKeyed(t *testing.T) {
+	cases := []struct {
+		name    string
+		segs    []string
+		compact string
+		want    string
+	}{
+		{
+			name:    "value leaf keyed by node name — unwrap to scalar",
+			segs:    []string{"system", "host-name"},
+			compact: `{"host-name":"vyos-lab"}`,
+			want:    `"vyos-lab"`,
+		},
+		{
+			name:    "timezone value leaf — unwrap",
+			segs:    []string{"system", "time-zone"},
+			compact: `{"time-zone":"America/Edmonton"}`,
+			want:    `"America/Edmonton"`,
+		},
+		{
+			name:    "multi-value leaf keyed by node name — unwrap to array",
+			segs:    []string{"system", "name-server"},
+			compact: `{"name-server":["1.1.1.1","8.8.8.8"]}`,
+			want:    `["1.1.1.1","8.8.8.8"]`,
+		},
+		{
+			name:    "container subtree (multiple keys) — left as-is",
+			segs:    []string{"service", "https"},
+			compact: `{"api":{"rest":{}},"port":"443"}`,
+			want:    `{"api":{"rest":{}},"port":"443"}`,
+		},
+		{
+			name:    "single-key object whose key is NOT the leaf — left as-is",
+			segs:    []string{"service"},
+			compact: `{"https":{"port":"443"}}`,
+			want:    `{"https":{"port":"443"}}`,
+		},
+		{
+			name:    "already-scalar response — left as-is",
+			segs:    []string{"system", "host-name"},
+			compact: `"vyos-lab"`,
+			want:    `"vyos-lab"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unwrapLeafKeyed(tc.segs, tc.compact); got != tc.want {
+				t.Fatalf("unwrapLeafKeyed() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNotFoundClassification(t *testing.T) {
 	for _, tc := range []struct {
 		msg  string

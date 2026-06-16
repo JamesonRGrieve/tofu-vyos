@@ -25,6 +25,11 @@ var (
 	_ resource.ResourceWithImportState = (*objectResource)(nil)
 )
 
+// privateManagedKey names the private-state record holding the last-declared
+// `config` JSON — the prune baseline (see Update). Kept out of the schema so it
+// never appears in plans.
+const privateManagedKey = "managed_config"
+
 // NewObjectResource constructs the generic vyos_config resource.
 func NewObjectResource() resource.Resource { return &objectResource{} }
 
@@ -127,6 +132,10 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	// Store the declared config verbatim so create plan/state are consistent;
 	// the next refresh (Read) replaces it with the full device subtree.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+	// Record the declared config in private state so a later Update prunes only
+	// genuinely declared-then-removed leaves — `config` in state is overwritten
+	// by Read with the full device subtree and must never be the prune baseline.
+	resp.Diagnostics.Append(resp.Private.SetKey(ctx, privateManagedKey, []byte(m.Config.ValueString()))...)
 }
 
 func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -159,15 +168,14 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 		resp.Diagnostics.AddError("VyOS read: invalid JSON from device", err.Error())
 		return
 	}
-	m.Config = types.StringValue(compact)
+	m.Config = types.StringValue(unwrapLeafKeyed(segs, compact))
 	m.ID = types.StringValue(strings.Join(segs, "/"))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
 func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan, state objectModel
+	var plan objectModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -177,15 +185,23 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	// set all declared leaves from the new config; delete leaves that were in
-	// the prior *declared* config (held as the full subtree in state) but are
-	// no longer declared. We diff declared-new against declared-old, not against
-	// the whole device object, so unmanaged config is never touched.
+	// the prior *declared* config but are no longer declared. The prune baseline
+	// is the previously-declared config from private state — NOT `config` in
+	// resource state, which Read overwrites with the full device subtree (diffing
+	// that would delete every unmanaged device leaf). An absent record (imported
+	// resource or pre-upgrade state) prunes nothing, so update is set-only — never
+	// destructive to unmanaged config.
 	setCmds, err := setCommands(segs, plan.Config.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid config", err.Error())
 		return
 	}
-	delCmds, err := pruneCommands(segs, state.Config.ValueString(), plan.Config.ValueString())
+	priorDeclared, d := req.Private.GetKey(ctx, privateManagedKey)
+	resp.Diagnostics.Append(d...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	delCmds, err := pruneCommands(segs, string(priorDeclared), plan.Config.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Invalid prior config", err.Error())
 		return
@@ -197,6 +213,7 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	plan.ID = types.StringValue(strings.Join(segs, "/"))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	resp.Diagnostics.Append(resp.Private.SetKey(ctx, privateManagedKey, []byte(plan.Config.ValueString()))...)
 }
 
 func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -423,6 +440,30 @@ func valueSubset(prior, cfg any) bool {
 		return true
 	}
 	return reflect.DeepEqual(prior, cfg)
+}
+
+// unwrapLeafKeyed reconciles VyOS's /retrieve shape with the "subtree below
+// path" convention setCommands/flatten use. VyOS returns a value-leaf addressed
+// at its own path keyed by its node name — showConfig ["system","host-name"]
+// returns {"host-name":"vyos-lab"}, not the bare "vyos-lab" — and a multi-value
+// leaf likewise as {"<name>":[...]}. Storing that keyed shape made Read's state
+// a level deeper than the declared config, so the subset modifier never matched
+// (perpetual drift) and pruneCommands built a duplicated delete path
+// (`delete system host-name host-name vyos-lab` → HTTP 400). When the response
+// is a single-key object whose key equals the last path segment, unwrap it to
+// the value so state matches the config convention and round-trips to 0-diff.
+func unwrapLeafKeyed(segs []string, compact string) string {
+	if len(segs) == 0 {
+		return compact
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(compact), &obj) != nil || len(obj) != 1 {
+		return compact
+	}
+	if v, ok := obj[segs[len(segs)-1]]; ok {
+		return string(v)
+	}
+	return compact
 }
 
 // compactJSON re-serializes raw JSON in compact, key-sorted-by-encoder form.
