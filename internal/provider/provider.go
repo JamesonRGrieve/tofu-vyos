@@ -84,6 +84,11 @@ func (p *vyosProvider) Configure(_ context.Context, req provider.ConfigureReques
 	resp.DataSourceData = client
 }
 
+// Resources returns the provider's resources. There is deliberately no
+// vyos_reconcile resource (the self-healing reload the config-vs-live router
+// providers carry): VyOS's `/configure` applies AND commits atomically, so the
+// running config never diverges from the committed config — a 0-change plan
+// already means live matches intent, leaving no drift class to heal.
 func (p *vyosProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{NewObjectResource}
 }
