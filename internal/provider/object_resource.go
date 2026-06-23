@@ -158,7 +158,14 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 		resp.Diagnostics.AddError("VyOS retrieve (showConfig) failed", err.Error())
 		return
 	}
-	if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
+	// An absent path returns a NotFound error (handled above); a successful
+	// showConfig returning `{}` is a PRESENT but childless node. When the resource
+	// manages a valueless tag node (declared config `{}`, e.g. `service ntp server
+	// <addr>`), that `{}` means present — keep it so it round-trips to 0-diff
+	// instead of being removed and re-created every plan. For a resource that
+	// declares children, a `{}`/empty read still means gone.
+	declaredEmpty := strings.TrimSpace(m.Config.ValueString()) == "{}"
+	if len(raw) == 0 || string(raw) == "null" || (string(raw) == "{}" && !declaredEmpty) {
 		// Path absent / empty subtree — treat as gone.
 		resp.State.RemoveResource(ctx)
 		return
@@ -450,8 +457,13 @@ func valueSubset(prior, cfg any) bool {
 	cl, cls := cfg.([]any)
 	pl, pls := prior.([]any)
 	if cls {
+		// VyOS returns a single-element multi-value leaf as a SCALAR, not a
+		// 1-element array (e.g. one `system name-server` reads back as "1.2.3.4",
+		// not ["1.2.3.4"]). Treat a scalar prior as a single-element list so a
+		// declared [x] matches a device scalar x; a declared [x,y] against scalar x
+		// still (correctly) drifts (y is genuinely missing).
 		if !pls {
-			return false
+			pl = []any{prior}
 		}
 		for _, ce := range cl {
 			found := false

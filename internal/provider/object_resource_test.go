@@ -77,6 +77,18 @@ func TestSubsetMatches(t *testing.T) {
 			wantMatched: false,
 		},
 		{
+			name:        "single-element array vs device scalar — match (VyOS single multi-value quirk)",
+			prior:       `{"name-server":"100.64.92.1"}`,
+			cfg:         `{"name-server":["100.64.92.1"]}`,
+			wantMatched: true,
+		},
+		{
+			name:        "two-element array vs device scalar — no match (second genuinely missing)",
+			prior:       `{"name-server":"100.64.92.1"}`,
+			cfg:         `{"name-server":["100.64.92.1","8.8.8.8"]}`,
+			wantMatched: false,
+		},
+		{
 			name:        "valueless node present — match",
 			prior:       `{"dhcp":{},"description":"wan"}`,
 			cfg:         `{"dhcp":{}}`,
