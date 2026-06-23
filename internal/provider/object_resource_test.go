@@ -59,9 +59,21 @@ func TestSubsetMatches(t *testing.T) {
 			wantMatched: true,
 		},
 		{
-			name:        "multi-value leaf order differs — no match",
+			name:        "multi-value leaf order differs — match (sets are order-independent)",
 			prior:       `{"address":["10.10.10.11/24","10.10.10.10/24"]}`,
 			cfg:         `{"address":["10.10.10.10/24","10.10.10.11/24"]}`,
+			wantMatched: true,
+		},
+		{
+			name:        "multi-value leaf: declared subset of larger live list — match (re-IP leaving a stale address)",
+			prior:       `{"address":["203.0.113.193/26","100.64.99.49/28"],"description":"LAN"}`,
+			cfg:         `{"address":["100.64.99.49/28"]}`,
+			wantMatched: true,
+		},
+		{
+			name:        "multi-value leaf: declared element absent from live list — no match",
+			prior:       `{"address":["10.10.10.10/24"]}`,
+			cfg:         `{"address":["10.10.10.99/24"]}`,
 			wantMatched: false,
 		},
 		{

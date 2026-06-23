@@ -423,7 +423,8 @@ func subsetMatches(prior, cfg string) bool {
 }
 
 // valueSubset reports whether cfg is a subset of prior. Objects are matched
-// key-wise and recursively; everything else must be deep-equal.
+// key-wise and recursively; lists element-wise (every declared element must be
+// present somewhere in the prior list); everything else must be deep-equal.
 func valueSubset(prior, cfg any) bool {
 	cm, cok := cfg.(map[string]any)
 	pm, pok := prior.(map[string]any)
@@ -434,6 +435,33 @@ func valueSubset(prior, cfg any) bool {
 		for k, cv := range cm {
 			pv, ok := pm[k]
 			if !ok || !valueSubset(pv, cv) {
+				return false
+			}
+		}
+		return true
+	}
+	// Multi-value leaves (e.g. `interfaces ethernet ethN address [...]`) are
+	// JSON arrays: a declared list is a subset when every declared element is
+	// present somewhere in the prior list (order-independent). Extra device-side
+	// elements are left unmanaged — the same manage-declared-only contract the
+	// object case enforces. Without this, a single declared address on an
+	// interface that carries others (e.g. a re-IP leaving a stale address)
+	// deep-equal-fails and drifts perpetually.
+	cl, cls := cfg.([]any)
+	pl, pls := prior.([]any)
+	if cls {
+		if !pls {
+			return false
+		}
+		for _, ce := range cl {
+			found := false
+			for _, pe := range pl {
+				if valueSubset(pe, ce) {
+					found = true
+					break
+				}
+			}
+			if !found {
 				return false
 			}
 		}
